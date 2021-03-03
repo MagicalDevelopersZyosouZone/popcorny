@@ -1,21 +1,23 @@
 // ==UserScript==
 // @name         popcorny
 // @namespace    studio.mdzz
-// @version      0.2.0
+// @version      0.2.1
 // @description  Watch videos together.
 // @author       Dwscdv3
-// @match        *://www.bilibili.com/video/*
-// @match        *://www.bilibili.com/bangumi/play/*
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_addStyle
-// @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
-// @license      GPL-3.0-or-later
 // @updateURL    https://github.com/MagicalDevelopersZyosouZone/popcorny/raw/main/popcorny.user.js
 // @downloadURL  https://github.com/MagicalDevelopersZyosouZone/popcorny/raw/main/popcorny.user.js
 // @homepageURL  https://dwscdv3.com/
 // @supportURL   https://github.com/MagicalDevelopersZyosouZone/popcorny/issues
+// @license      GPL-3.0-or-later
+// @match        *://www.bilibili.com/video/*
+// @match        *://www.bilibili.com/bangumi/play/*
+// @match        *://www.youtube.com/watch?*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_notification
+// @grant        unsafeWindow
 // ==/UserScript==
 
 /* global
@@ -26,9 +28,12 @@
     'use strict';
 
     const Prefix = 'popcorny';
-    const DeviationThreshold = 5000;
+    const DeviationThreshold = 5;
+    const HeartbeatInterval = 5000;
     const PeerPurgeTimeout = 15000;
 
+    // You can add support by add site specific code to SiteProfiles.
+    // A site profile must based on DefaultBehavior and its nested objects, see profile 'www.bilibili.com' for example.
     const DefaultBehavior = {
         profile: {
             getSelfUID: () => null,
@@ -38,10 +43,11 @@
         video: {
             videoElementSelector: 'video',
             getBaseElement() { return $(this.videoElementSelector); },
+            getDuration() { return this.getBaseElement().duration; },
             getPaused() { return this.getBaseElement().paused; },
             setPaused(value) { value ? this.getBaseElement().pause() : this.getBaseElement().play(); },
             getCurrentTime() { return this.getBaseElement().currentTime; },
-            setCurrentTime(value) { this.getBaseElement().curreentTime = value; },
+            setCurrentTime(value) { this.getBaseElement().currentTime = value; },
             getPlaybackRate() { return this.getBaseElement().playbackRate; },
             setPlaybackRate(value) { this.getBaseElement().playbackRate = value; },
             play() { this.getBaseElement().play(); },
@@ -53,7 +59,11 @@
         },
         integration: {
             toolbarElementSelector: 'body',
-            newSessionButtonElement: createElement('button', { textContent: '新建放映室' }),
+            newSessionButtonElement: createElement('button', {
+                className: `${Prefix}-new-session-button`,
+                textContent: 'Watch Together',
+                onclick: newSession,
+            }),
             panelParentElementSelector: 'body',
             panelElement: createElement(`${Prefix}-panel`, {
                 children: [
@@ -88,6 +98,11 @@
         },
         isReady() { return $(this.video.videoElementSelector) && $(this.video.videoElementSelector).duration > 0; },
         style: `
+            .${Prefix}-new-session-button {
+                position: fixed;
+                right: 20px;
+                bottom: 20px;
+            }
             ${Prefix}-panel {
                 display: block;
                 position: absolute;
@@ -192,6 +207,7 @@
             }),
             video: Object.assign({}, DefaultBehavior.video, {
                 videoElementSelector: '.bilibili-player-video video',
+                getDuration() { return player.getDuration(); },
                 getPaused() { return player.getState() !== 'PLAYING'; },
                 setPaused(value) { value ? player.pause() : player.play(); },
                 getCurrentTime() { return player.getCurrentTime(); },
@@ -215,6 +231,7 @@
                 toolbarElementSelector: '.video-toolbar .ops, #toolbar_module',
                 newSessionButtonElement: createElement('span', {
                     className: 'like-info',
+                    onclick: newSession,
                     children: [
                         createElement('i', {
                             textContent: '⪘',
@@ -229,7 +246,7 @@
             isReady() {
                 return DefaultBehavior.isReady()
                     && unsafeWindow.player
-                    && (query.has('t') ? player.getState() === 'PLAYING' : true);
+                    && (url.searchParams.has('t') ? player.getState() === 'PLAYING' : true);
             },
             style: `
                 .video-toolbar .ops .share {
@@ -255,10 +272,41 @@
             `,
         }),
     };
-    const site = unsafeWindow[Prefix] = SiteProfiles[location.hostname] || DefaultBehavior;
+
+    // ==================
+    // Core codes below.
+    // ==================
+
+    const site = unsafeWindow[Prefix] = SiteProfiles[location.host] || DefaultBehavior;
     const { profile, video, integration, style } = site;
+    const knownPeers = new Map();
+    const url = new URL(location.href);
+    let ws = null;
+    let serverURL = null;
+    let id = null;
+    let pushDisabled = false;
+    let keepAliveTimer = null;
+    let purgeKnownPeersTimer = null;
+
+    // Entry point.
     GM_addStyle(DefaultBehavior.style);
     GM_addStyle(style);
+    if (!url.searchParams.has(`${Prefix}_url`)) {
+        executeWhen(site.isReady.bind(site), () => $(integration.toolbarElementSelector).appendChild(integration.newSessionButtonElement));
+    } else {
+        executeWhen(site.isReady.bind(site), () => {
+            $(integration.panelParentElementSelector).appendChild(integration.panelElement);
+
+            serverURL = `${url.searchParams.get(`${Prefix}_url`)}/session/${url.searchParams.get(`${Prefix}_session`)}`
+                .replace('https', 'wss');
+            ws = new WebSocket(serverURL);
+            ws.onmessage = onMessage;
+            ws.onerror = ws.onclose = onDisconnected;
+            keepAliveTimer = setInterval(() => push('keepAlive'), HeartbeatInterval);
+            setTimeout(hookPlayStateChange, 0);
+            const purgeKnownPeersTimer = setInterval(purgeKnownPeers, 1000);
+        });
+    }
 
     const MessageHandlers = {
         handshake(msg) {
@@ -283,46 +331,20 @@
         },
     };
 
-    let ws = null;
-    let serverURL = null;
-    let id = null;
-    let pushDisabled = false;
-    let keepAliveTimer = null;
-    let purgeKnownPeersTimer = null;
-    const knownPeers = new Map();
-
-    const query = new URLSearchParams(location.search);
-    if (!query.has(`${Prefix}_url`)) {
-        executeWhen(site.isReady, () => {
-            integration.newSessionButtonElement.addEventListener('click', newSession);
-            $(integration.toolbarElementSelector).appendChild(integration.newSessionButtonElement);
-        });
-    } else {
-        executeWhen(site.isReady, () => {
-            $(integration.panelParentElementSelector).appendChild(integration.panelElement);
-
-            serverURL = `${query.get(`${Prefix}_url`)}/session/${query.get(`${Prefix}_session`)}`.replace('https', 'wss');
-            ws = new WebSocket(serverURL);
-            ws.onmessage = function (e) {
-                const msg = JSON.parse(e.data);
-                if (msg.uid !== undefined) {
-                    setPeerProfile(msg);
-                }
-                const handler = MessageHandlers[msg.type];
-                if (handler) {
-                    handler(msg);
-                }
-            };
-            ws.onerror = function (e) {
-                alert('Connection lost.');
-                location.reload();
-            };
-            keepAliveTimer = setInterval(() => push('keepAlive'), 5000);
-            setTimeout(hookPlayStateChange, 0);
-            const purgeKnownPeersTimer = setInterval(purgeKnownPeers, 1000);
-        });
+    function onMessage(event) {
+        const msg = JSON.parse(event.data);
+        if (msg.uid !== undefined) {
+            setPeerProfile(msg);
+        }
+        const handler = MessageHandlers[msg.type];
+        if (handler) {
+            handler(msg);
+        }
     }
-
+    function onDisconnected(event) {
+        alert('Connection lost.');
+        location.reload();
+    }
     function hookPlayStateChange() {
         const videoElement = video.getBaseElement();
         videoElement.addEventListener('pause', video.onpause);
@@ -352,7 +374,7 @@
         setTimeout(() => (pushDisabled = false), 100);
     }
     function push(type, recipient) {
-        if (!pushDisabled) {
+        if (!pushDisabled && video.getCurrentTime() < video.getDuration() - 1) {
             ws.send(JSON.stringify({
                 recipient,
                 type: type || 'push',
@@ -365,13 +387,13 @@
         }
     }
     function newSession() {
-        let url = prompt('Server URL:', GM_getValue('url', 'https://example.com/'));
-        if (url) {
-            url = url.replace(/^((https?:)?\/\/)?/, 'https://');
-            GM_setValue('url', url);
+        let serverURL = prompt('Server URL:', GM_getValue('url', 'https://example.com/'));
+        if (serverURL) {
+            serverURL = serverURL.replace(/^((https?:)?\/\/)?/, 'https://');
+            GM_setValue('url', serverURL);
             GM_xmlhttpRequest({
                 method: 'POST',
-                url: `${url}/session`,
+                url: `${serverURL}/session`,
                 headers: {
                     'Content-Type': 'application/json',
                 },
@@ -380,11 +402,18 @@
                 }),
                 onload: function (response) {
                     if (response.status == 200) {
+                        GM_notification({
+                            text: 'The share link has been copied to the clipboard.',
+                            title: `${Prefix} - ${location.host}`,
+                            highlight: true,
+                            timeout: 10000,
+                        });
                         const sessionId = JSON.parse(response.responseText).sessionId;
-                        query.set(`${Prefix}_url`, url);
-                        query.set(`${Prefix}_session`, sessionId);
-                        query.set('t', '0.01');
-                        location.search = query.toString();
+                        url.searchParams.set(`${Prefix}_url`, serverURL);
+                        url.searchParams.set(`${Prefix}_session`, sessionId);
+                        url.searchParams.set('t', '0.01');
+                        navigator.clipboard.writeText(url.href);
+                        location.href = url.href;
                     }
                     else {
                         alert('Unable to connect to the server.');
@@ -403,6 +432,15 @@
                 const peer = knownPeers.get(msg.clientId);
                 peer.nickname = results[0];
                 peer.avatarURL = results[1];
+                if (msg.type && msg.type !== 'queryResponse') {
+                    GM_notification({
+                        text: `${peer.nickname} entered.`,
+                        title: `${Prefix} - ${location.host}`,
+                        image: peer.avatarURL,
+                        highlight: true,
+                        timeout: 5000,
+                    });
+                }
                 renderPeersPanel();
             });
         }
@@ -411,6 +449,13 @@
     function purgeKnownPeers() {
         for (const [clientId, peer] of knownPeers) {
             if (clientId != id && Date.now() - peer.lastActiveTime > PeerPurgeTimeout) {
+                GM_notification({
+                    text: `${peer.nickname} left.`,
+                    title: `${Prefix} - ${location.host}`,
+                    image: peer.avatarURL,
+                    highlight: true,
+                    timeout: 5000,
+                });
                 knownPeers.delete(clientId);
                 renderPeersPanel();
             }
@@ -424,7 +469,7 @@
         }
     }
 
-    /* Utility functions */
+    // Utility functions.
     function $(selector) { return document.querySelector(selector); }
     function createElement(type, args) {
         var element = document.createElement(type);
