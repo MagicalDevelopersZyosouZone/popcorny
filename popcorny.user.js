@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         popcorny
 // @namespace    studio.mdzz
-// @version      0.2.1
+// @version      0.3.0
 // @description  Watch videos together.
 // @author       Dwscdv3
 // @updateURL    https://github.com/MagicalDevelopersZyosouZone/popcorny/raw/main/popcorny.user.js
@@ -31,6 +31,9 @@
     const DeviationThreshold = 5;
     const HeartbeatInterval = 5000;
     const PeerPurgeTimeout = 15000;
+    const FloatAvatarShowTime = 4000;
+
+    let _ = {}; // An object to store temporary variables from object initializers.
 
     // You can add support by add site specific code to SiteProfiles.
     // A site profile must based on DefaultBehavior and its nested objects, see profile 'www.bilibili.com' for example.
@@ -43,9 +46,11 @@
         video: {
             videoElementSelector: 'video',
             getBaseElement() { return $(this.videoElementSelector); },
-            getDuration() { return this.getBaseElement().duration; },
+            getId() { return location.pathname; },
+            setId(value) { location.pathname = value; },
             getPaused() { return this.getBaseElement().paused; },
             setPaused(value) { value ? this.getBaseElement().pause() : this.getBaseElement().play(); },
+            getDuration() { return this.getBaseElement().duration; },
             getCurrentTime() { return this.getBaseElement().currentTime; },
             setCurrentTime(value) { this.getBaseElement().currentTime = value; },
             getPlaybackRate() { return this.getBaseElement().playbackRate; },
@@ -59,16 +64,22 @@
         },
         integration: {
             toolbarElementSelector: 'body',
+            panelParentElementSelector: 'body',
             newSessionButtonElement: createElement('button', {
                 className: `${Prefix}-new-session-button`,
                 textContent: 'Watch Together',
                 onclick: newSession,
             }),
-            panelParentElementSelector: 'body',
+            floatAvatarElement: _.floatAvatarElement = createElement('img', {
+                className: `${Prefix}-avatar`,
+            }),
             panelElement: createElement(`${Prefix}-panel`, {
                 children: [
                     createElement(`${Prefix}-panel-header`, {
-                        textContent: '⪘',
+                        children: [
+                            '⪘',
+                            _.floatAvatarElement,
+                        ],
                     }),
                     createElement(`${Prefix}-panel-body`, {
                         children: [
@@ -126,6 +137,18 @@
                 backdrop-filter: blur(5px) brightness(0.75);
                 transition: all 0.2s;
                 z-index: 1001;
+            }
+            ${Prefix}-panel-header .${Prefix}-avatar {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                opacity: 0;
+                transition: opacity 0.5s;
+            }
+            ${Prefix}-panel-header .${Prefix}-avatar.show {
+                opacity: 1;
             }
             ${Prefix}-panel:hover ${Prefix}-panel-header {
                 color: black;
@@ -185,6 +208,8 @@
                 width: 24px;
                 height: 24px;
                 margin-right: 0.5em;
+            }
+            .${Prefix}-avatar {
                 border-radius: 1000px;
                 object-fit: cover;
             }
@@ -209,7 +234,7 @@
                 videoElementSelector: '.bilibili-player-video video',
                 getDuration() { return player.getDuration(); },
                 getPaused() { return player.getState() !== 'PLAYING'; },
-                setPaused(value) { value ? player.pause() : player.play(); },
+                setPaused(value) { player.getState() === 'BUFFERING' || (value ? player.pause() : player.play()); },
                 getCurrentTime() { return player.getCurrentTime(); },
                 setCurrentTime(value) { player.seek(value, this.getPaused()); },
                 setPlaybackRate(value) {
@@ -229,6 +254,7 @@
             }),
             integration: Object.assign({}, DefaultBehavior.integration, {
                 toolbarElementSelector: '.video-toolbar .ops, #toolbar_module',
+                panelParentElementSelector: '.bilibili-player-video-wrap',
                 newSessionButtonElement: createElement('span', {
                     className: 'like-info',
                     onclick: newSession,
@@ -241,7 +267,6 @@
                         }),
                     ],
                 }),
-                panelParentElementSelector: '.bilibili-player-video-wrap',
             }),
             isReady() {
                 return DefaultBehavior.isReady()
@@ -281,32 +306,18 @@
     const { profile, video, integration, style } = site;
     const knownPeers = new Map();
     const url = new URL(location.href);
+    const serverURL = url.searchParams.get(`${Prefix}_url`);
+    const sessionId = url.searchParams.get(`${Prefix}_session`);
     let ws = null;
-    let serverURL = null;
+    let wsURL = null;
     let id = null;
     let pushDisabled = false;
-    let keepAliveTimer = null;
-    let purgeKnownPeersTimer = null;
+    let hideFloatAvatarTimer = null;
 
     // Entry point.
     GM_addStyle(DefaultBehavior.style);
     GM_addStyle(style);
-    if (!url.searchParams.has(`${Prefix}_url`)) {
-        executeWhen(site.isReady.bind(site), () => $(integration.toolbarElementSelector).appendChild(integration.newSessionButtonElement));
-    } else {
-        executeWhen(site.isReady.bind(site), () => {
-            $(integration.panelParentElementSelector).appendChild(integration.panelElement);
-
-            serverURL = `${url.searchParams.get(`${Prefix}_url`)}/session/${url.searchParams.get(`${Prefix}_session`)}`
-                .replace('https', 'wss');
-            ws = new WebSocket(serverURL);
-            ws.onmessage = onMessage;
-            ws.onerror = ws.onclose = onDisconnected;
-            keepAliveTimer = setInterval(() => push('keepAlive'), HeartbeatInterval);
-            setTimeout(hookPlayStateChange, 0);
-            const purgeKnownPeersTimer = setInterval(purgeKnownPeers, 1000);
-        });
-    }
+    executeWhen(site.isReady.bind(site), main);
 
     const MessageHandlers = {
         handshake(msg) {
@@ -325,14 +336,52 @@
         },
         push(msg) {
             sync(msg, { forced: true });
+            const peer = knownPeers.get(msg.clientId);
+            if (peer) {
+                integration.floatAvatarElement.src = peer.avatarURL;
+                integration.floatAvatarElement.classList.add('show');
+                clearTimeout(hideFloatAvatarTimer);
+                hideFloatAvatarTimer = setTimeout(() => {
+                    integration.floatAvatarElement.classList.remove('show');
+                }, FloatAvatarShowTime);
+            }
         },
         keepAlive(msg) {
             sync(msg);
         },
     };
 
+    function main() {
+        setInterval(() => {
+            history.replaceState(null, '', getShareableURL(serverURL, sessionId));
+            if (isValidURL()) {
+                integration.newSessionButtonElement.remove();
+                if (!integration.panelElement.isConnected) {
+                    $(integration.panelParentElementSelector).append(integration.panelElement);
+                }
+                hookPlayStateChange();
+            } else {
+                integration.panelElement.remove();
+                if (!integration.newSessionButtonElement.isConnected) {
+                    $(integration.toolbarElementSelector).append(integration.newSessionButtonElement);
+                }
+            }
+        }, 500);
+
+        if (isValidURL()) {
+            ws = new WebSocket(`${serverURL.replace('https', 'wss')}/session/${sessionId}`);
+            ws.onmessage = onMessage;
+            ws.onerror = ws.onclose = onDisconnected;
+            setInterval(() => push('keepAlive'), HeartbeatInterval);
+            setInterval(purgeKnownPeers, 1000);
+        }
+    }
+
     function onMessage(event) {
         const msg = JSON.parse(event.data);
+        if (msg.type !== 'keepAlive' && msg.video && video.getId() !== msg.video) {
+            video.setId(msg.video);
+        }
         if (msg.uid !== undefined) {
             setPeerProfile(msg);
         }
@@ -347,14 +396,17 @@
     }
     function hookPlayStateChange() {
         const videoElement = video.getBaseElement();
-        videoElement.addEventListener('pause', video.onpause);
-        videoElement.addEventListener('play', video.onplay);
-        videoElement.addEventListener('seeking', video.onseeking);
-        videoElement.addEventListener('ratechange', video.onratechange);
-        videoElement.addEventListener('pause', () => push());
-        videoElement.addEventListener('play', () => push());
-        videoElement.addEventListener('seeking', () => push());
-        videoElement.addEventListener('ratechange', () => push());
+        if (!videoElement.dataset[`${Prefix}ListenerAttached`]) {
+            videoElement.addEventListener('pause', video.onpause);
+            videoElement.addEventListener('play', video.onplay);
+            videoElement.addEventListener('seeking', video.onseeking);
+            videoElement.addEventListener('ratechange', video.onratechange);
+            videoElement.addEventListener('pause', () => push());
+            videoElement.addEventListener('play', () => push());
+            videoElement.addEventListener('seeking', () => push());
+            videoElement.addEventListener('ratechange', () => push());
+            videoElement.dataset[`${Prefix}ListenerAttached`] = 'true';
+        }
     }
     function queryPlayState() {
         ws.send(JSON.stringify({
@@ -371,7 +423,7 @@
         if (options.forced || Math.abs(remote.currentTime - video.getCurrentTime()) > DeviationThreshold) {
             video.setCurrentTime(remote.currentTime);
         }
-        setTimeout(() => (pushDisabled = false), 100);
+        setTimeout(() => (pushDisabled = false), 2000);
     }
     function push(type, recipient) {
         if (!pushDisabled && video.getCurrentTime() < video.getDuration() - 1) {
@@ -383,6 +435,7 @@
                 paused: video.getPaused(),
                 currentTime: video.getCurrentTime(),
                 playbackRate: video.getPlaybackRate(),
+                video: video.getId(),
             }));
         }
     }
@@ -409,11 +462,9 @@
                             timeout: 10000,
                         });
                         const sessionId = JSON.parse(response.responseText).sessionId;
-                        url.searchParams.set(`${Prefix}_url`, serverURL);
-                        url.searchParams.set(`${Prefix}_session`, sessionId);
-                        url.searchParams.set('t', '0.01');
-                        navigator.clipboard.writeText(url.href);
-                        location.href = url.href;
+                        const url = getShareableURL(serverURL, sessionId);
+                        navigator.clipboard.writeText(url);
+                        location.href = url;
                     }
                     else {
                         alert('Unable to connect to the server.');
@@ -465,8 +516,17 @@
         const peersPanel = $(`${Prefix}-peer-panel`);
         peersPanel.textContent = '';
         for (const [clientId, peer] of knownPeers) {
-            peersPanel.appendChild(integration.getPeerElement(peer));
+            peersPanel.append(integration.getPeerElement(peer));
         }
+    }
+
+    function isValidURL() { return url.searchParams.has(`${Prefix}_url`) && url.searchParams.has(`${Prefix}_session`); }
+    function getShareableURL(serverURL, sessionId) {
+        const url = new URL(location.href);
+        url.searchParams.set(`${Prefix}_url`, serverURL);
+        url.searchParams.set(`${Prefix}_session`, sessionId);
+        url.searchParams.set('t', '0.01');
+        return url.href;
     }
 
     // Utility functions.
@@ -476,23 +536,11 @@
         for (var prop in args) {
             var arg = args[prop];
             if (prop === 'classList' && arg instanceof Array) {
-                arg.forEach(function (cls) {
-                    if (typeof cls === 'string') {
-                        element.classList.add(cls);
-                    }
-                });
+                element.classList.add(...arg);
             } else if (prop === 'children' && arg instanceof Array) {
-                arg.forEach(function (child) {
-                    if (child instanceof Node) {
-                        element.appendChild(child);
-                    } else if (typeof child === 'string') {
-                        element.appendChild(document.createTextNode(child));
-                    }
-                });
+                element.append(...arg);
             } else if (prop === 'styles' && arg instanceof Object) {
-                for (var name in arg) {
-                    element.style[name] = arg[name];
-                }
+                Object.assign(element.style, arg);
             } else if (prop.startsWith('attr_')) {
                 element.setAttribute(prop.substring(5), arg);
             } else if (prop.startsWith('on')) {
