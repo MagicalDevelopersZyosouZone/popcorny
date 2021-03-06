@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         popcorny
 // @namespace    studio.mdzz
-// @version      0.3.0
+// @version      0.3.1
 // @description  Watch videos together.
 // @author       Dwscdv3
 // @updateURL    https://github.com/MagicalDevelopersZyosouZone/popcorny/raw/main/popcorny.user.js
@@ -28,7 +28,7 @@
     'use strict';
 
     const Prefix = 'popcorny';
-    const DeviationThreshold = 5;
+    const DeviationThreshold = 5000;
     const HeartbeatInterval = 5000;
     const PeerPurgeTimeout = 15000;
     const FloatAvatarShowTime = 4000;
@@ -146,6 +146,7 @@
                 height: 100%;
                 opacity: 0;
                 transition: opacity 0.5s;
+                pointer-events: none;
             }
             ${Prefix}-panel-header .${Prefix}-avatar.show {
                 opacity: 1;
@@ -228,10 +229,22 @@
                   ? 'https://static.hdslb.com/images/member/noface.gif'
                   : fetch(`https://api.bilibili.com/x/web-interface/card?mid=${uid}`)
                     .then(response => response.json())
-                    .then(responseBody => responseBody.data.card.face),
+                    .then(responseBody => responseBody.data.card.face.replace(/^((https?:)?\/\/)?/, 'https://')),
             }),
             video: Object.assign({}, DefaultBehavior.video, {
                 videoElementSelector: '.bilibili-player-video video',
+                getId() { return `${location.pathname},${new URL(location.href).searchParams.get('p') || '1'}`; },
+                setId(value) {
+                    const [pathname, part] = value.split(',');
+                    const url = getShareableURL(serverURL, sessionId);
+                    url.pathname = pathname;
+                    if (part === '1') {
+                        url.searchParams.delete('p');
+                    } else {
+                        url.searchParams.set('p', part);
+                    }
+                    location.href = url.href;
+                },
                 getDuration() { return player.getDuration(); },
                 getPaused() { return player.getState() !== 'PLAYING'; },
                 setPaused(value) { player.getState() === 'BUFFERING' || (value ? player.pause() : player.play()); },
@@ -296,6 +309,17 @@
                 }
             `,
         }),
+        'www.youtube.com': Object.assign({}, DefaultBehavior, {
+            video: {
+                getId() { return new URL(location.href).searchParams.get('v'); },
+                setId(value) {
+                    const url = getShareableURL(serverURL, sessionId);
+                    url.pathname = '/watch';
+                    url.searchParams.set('v', value);
+                    location.href = url.href;
+                },
+            },
+        }),
     };
 
     // ==================
@@ -312,7 +336,7 @@
     let wsURL = null;
     let id = null;
     let pushDisabled = false;
-    let hideFloatAvatarTimer = null;
+    let syncDisabled = false;
 
     // Entry point.
     GM_addStyle(DefaultBehavior.style);
@@ -336,15 +360,9 @@
         },
         push(msg) {
             sync(msg, { forced: true });
-            const peer = knownPeers.get(msg.clientId);
-            if (peer) {
-                integration.floatAvatarElement.src = peer.avatarURL;
-                integration.floatAvatarElement.classList.add('show');
-                clearTimeout(hideFloatAvatarTimer);
-                hideFloatAvatarTimer = setTimeout(() => {
-                    integration.floatAvatarElement.classList.remove('show');
-                }, FloatAvatarShowTime);
-            }
+            showFloatAvatar(msg.clientId);
+            syncDisabled = true;
+            timer.oneshot('enableSync', () => (syncDisabled = false), 1000);
         },
         keepAlive(msg) {
             sync(msg);
@@ -353,7 +371,9 @@
 
     function main() {
         setInterval(() => {
-            history.replaceState(null, '', getShareableURL(serverURL, sessionId));
+            if (location.href !== getShareableURL(serverURL, sessionId).href) {
+                history.replaceState(null, '', getShareableURL(serverURL, sessionId).href);
+            }
             if (isValidURL()) {
                 integration.newSessionButtonElement.remove();
                 if (!integration.panelElement.isConnected) {
@@ -369,7 +389,8 @@
         }, 500);
 
         if (isValidURL()) {
-            ws = new WebSocket(`${serverURL.replace('https', 'wss')}/session/${sessionId}`);
+            const clientId = sessionStorage.getItem(`${Prefix}-clientIdOf-${sessionId}`);
+            ws = new WebSocket(`${serverURL.replace('https', 'wss')}/session/${sessionId}/${clientId || ''}`);
             ws.onmessage = onMessage;
             ws.onerror = ws.onclose = onDisconnected;
             setInterval(() => push('keepAlive'), HeartbeatInterval);
@@ -380,6 +401,7 @@
     function onMessage(event) {
         const msg = JSON.parse(event.data);
         if (msg.type !== 'keepAlive' && msg.video && video.getId() !== msg.video) {
+            sessionStorage.setItem(`${Prefix}-clientIdOf-${sessionId}`, id);
             video.setId(msg.video);
         }
         if (msg.uid !== undefined) {
@@ -417,13 +439,18 @@
     }
     function sync(remote, options) {
         options = options || {};
-        pushDisabled = true;
+        if (syncDisabled && remote.type === 'keepAlive') {
+            return;
+        }
+        if (remote.type === 'push') {
+            pushDisabled = true;
+            setTimeout(() => (pushDisabled = false), 100);
+        }
         video.setPaused(remote.paused);
         video.setPlaybackRate(remote.playbackRate);
-        if (options.forced || Math.abs(remote.currentTime - video.getCurrentTime()) > DeviationThreshold) {
+        if (options.forced || Math.abs(remote.currentTime - video.getCurrentTime()) * 1000 > DeviationThreshold) {
             video.setCurrentTime(remote.currentTime);
         }
-        setTimeout(() => (pushDisabled = false), 2000);
     }
     function push(type, recipient) {
         if (!pushDisabled && video.getCurrentTime() < video.getDuration() - 1) {
@@ -437,6 +464,8 @@
                 playbackRate: video.getPlaybackRate(),
                 video: video.getId(),
             }));
+            syncDisabled = true;
+            timer.oneshot('enableSync', () => (syncDisabled = false), 1000);
         }
     }
     function newSession() {
@@ -463,8 +492,8 @@
                         });
                         const sessionId = JSON.parse(response.responseText).sessionId;
                         const url = getShareableURL(serverURL, sessionId);
-                        navigator.clipboard.writeText(url);
-                        location.href = url;
+                        navigator.clipboard.writeText(url.href);
+                        location.href = url.href;
                     }
                     else {
                         alert('Unable to connect to the server.');
@@ -519,14 +548,29 @@
             peersPanel.append(integration.getPeerElement(peer));
         }
     }
+    function showFloatAvatar(clientId) {
+        const peer = knownPeers.get(clientId);
+        if (peer) {
+            integration.floatAvatarElement.src = peer.avatarURL;
+            integration.floatAvatarElement.classList.add('show');
+            timer.oneshot('hideFloatAvatar', () => {
+                integration.floatAvatarElement.classList.remove('show');
+            }, FloatAvatarShowTime);
+        }
+    }
 
     function isValidURL() { return url.searchParams.has(`${Prefix}_url`) && url.searchParams.has(`${Prefix}_session`); }
     function getShareableURL(serverURL, sessionId) {
         const url = new URL(location.href);
-        url.searchParams.set(`${Prefix}_url`, serverURL);
-        url.searchParams.set(`${Prefix}_session`, sessionId);
-        url.searchParams.set('t', '0.01');
-        return url.href;
+        if (serverURL && sessionId) {
+            url.searchParams.set(`${Prefix}_url`, serverURL);
+            url.searchParams.set(`${Prefix}_session`, sessionId);
+            url.searchParams.set('t', '0.01');
+        } else {
+            url.searchParams.delete(`${Prefix}_url`);
+            url.searchParams.delete(`${Prefix}_session`);
+        }
+        return url;
     }
 
     // Utility functions.
@@ -559,4 +603,17 @@
             }
         }, interval || 100);
     }
+    const timer = (function () {
+        this.timers = {};
+        this.oneshot = function (id, callback, interval) {
+            clearTimeout(this.timers[id]);
+            clearInterval(this.timers[id]);
+            this.timers[id] = setTimeout(callback, interval);
+        };
+        this.periodic = function (id, callback, interval) {
+            clearTimeout(this.timers[id]);
+            clearInterval(this.timers[id]);
+            this.timers[id] = setInterval(callback, interval);
+        };
+    })();
 })();
