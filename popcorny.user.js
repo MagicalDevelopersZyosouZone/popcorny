@@ -149,7 +149,7 @@
     const Default = {
         server: {
             url: new URL(location).searchParams.get(`${ProductName}_url`),
-            clientId: sessionStorage.getItem(`${ProductName}-clientIdOf-${session.id}`),
+            clientId: null,
             ws: null,
             peers: new Map(),
             pushDisabled: false,
@@ -926,6 +926,7 @@ ${ProductName}-chat-send-button:active {
         UI.injectElement();
 
         if (session.isValidURL()) {
+            server.clientId = sessionStorage.getItem(`${ProductName}-clientIdOf-${session.id}`);
             server.connect();
             when(server.isConnected).then(video.hookEvents);
             setInterval(() => server.pushState('keepAlive'), HeartbeatInterval);
