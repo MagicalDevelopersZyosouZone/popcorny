@@ -128,7 +128,28 @@
                     && unsafeWindow.player
                     && (new URL(location).searchParams.has('t') === '0.01' ? player.getState() === 'PLAYING' : true);
             },
-            style: `...`,
+            style: `
+                .video-toolbar .ops .share {
+                    width: 92px;
+                }
+                .bilibili-player-video-btn.disabled > * {
+                    opacity: 0.4;
+                    cursor: not-allowed;
+                }
+                #eplist_module.disabled ul {
+                    cursor: not-allowed;
+                }
+                #eplist_module.disabled ul > li {
+                    pointer-events: none;
+                }
+                .bilibili-player-video-btn.disabled > .bilibili-player-video-btn-menu-wrap,
+                .bilibili-player-video-btn-speed.disabled > .bilibili-player-video-btn-speed-menu-wrap {
+                    display: none;
+                }
+                #toolbar_module .mobile-info {
+                    margin-right: 20px;
+                }
+                `,
         },
         'www.youtube.com': {
             video: {
